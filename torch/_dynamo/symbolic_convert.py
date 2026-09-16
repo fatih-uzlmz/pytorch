@@ -2429,29 +2429,51 @@ class InstructionTranslatorBase(
             alias = f"__import_{module_name.replace('.', '_dot_')}"
 
         f_globals = self.output.global_scope
+        # The alias outlives the compile that minted it, so a later writer that
+        # resolves the name itself -- CompilePackage.install, or an artifact load
+        # seeding a guard scope -- can leave it bound to a module object of this
+        # name that is not the one resolved here. That is not the name collision
+        # this checks for (two module names still mangle to one alias): such a
+        # slot is accepted and, below, written as an empty one is.
         if alias in f_globals and f_globals[alias] is not value:
             bound = f_globals[alias]
-            # Named by type, never repr'd: __repr__ is user code too.
-            offender = type(bound).__name__
-            if isinstance(bound, types.ModuleType):
-                # __name__ out of the instance dict: a PEP 562 module __getattr__
-                # and a class-level __getattribute__ (importlib.util._LazyModule
-                # imports on any attribute read) are user code that must not run
-                # inside a trace.
-                name = object.__getattribute__(bound, "__dict__").get("__name__")
-                if name is not None:
-                    offender = f"{offender} named {name}"
-            unimplemented(
-                gb_type="Import alias already bound",
-                context=f"{alias} for {module_name}: {offender}",
-                explanation=f"The module alias {alias} for {module_name} is already "
-                f"bound to a {offender} in the globals of the frame being traced.",
-                hints=[
-                    "Remove or rename the global of that name in the module of the frame being traced.",
-                    "If it holds a module of another name, two module names mangle onto this alias: rename one of the two modules.",
-                    "Dynamo caches this frame's outcome -- skipped, or compiled up to the last checkpoint before the import -- and nothing guards this global, so fixing it later does not retrace the frame: call torch._dynamo.reset() after fixing it.",
-                ],
+            # Both names out of the instance dicts: a PEP 562 module __getattr__
+            # and a class-level __getattribute__ (importlib.util._LazyModule
+            # imports on any attribute read) are user code that must not run
+            # inside a trace.
+            bound_name = (
+                object.__getattribute__(bound, "__dict__").get("__name__")
+                if isinstance(bound, types.ModuleType)
+                else None
             )
+            # A sys.modules key need not be the module's own __name__ --
+            # os.path is named posixpath, and torch's own BC shim entries are
+            # all of that shape -- so recognize a stale module by the name the
+            # resolved module answers to as well as by the key. Two module
+            # names mangling onto one alias still graph break: their resolved
+            # names differ.
+            value_name = (
+                object.__getattribute__(value, "__dict__").get("__name__")
+                if isinstance(value, types.ModuleType)
+                else None
+            )
+            accepted = (module_name, value_name) if value_name else (module_name,)
+            if bound_name not in accepted:
+                # Named by type, never repr'd: __repr__ is user code too.
+                offender = type(bound).__name__
+                if bound_name is not None:
+                    offender = f"{offender} named {bound_name}"
+                unimplemented(
+                    gb_type="Import alias already bound",
+                    context=f"{alias} for {module_name}: {offender}",
+                    explanation=f"The module alias {alias} for {module_name} is already "
+                    f"bound to a {offender} in the globals of the frame being traced.",
+                    hints=[
+                        "Remove or rename the global of that name in the module of the frame being traced.",
+                        "If it holds a module of another name, two module names mangle onto this alias: rename one of the two modules.",
+                        "Dynamo caches this frame's outcome -- skipped, or compiled up to the last checkpoint before the import -- and nothing guards this global, so fixing it later does not retrace the frame: call torch._dynamo.reset() after fixing it.",
+                    ],
+                )
         # Recorded only once the check has passed: the package entry outlives a
         # graph break here, and install() binds every recorded alias.
         if self.package is not None:
